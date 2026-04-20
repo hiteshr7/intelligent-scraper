@@ -228,7 +228,7 @@ if st.button("🚀 Start End-to-End Pipeline", type="primary", use_container_wid
                 
                 # Posts
                 while len(collected_posts) < ig_post_limit:
-                    data = fetch_with_retry(f"https://{IG_API_HOST}/search_hashtag.php", IG_HEADERS, {"hashtag": kw, "pagination_token": pag_token}, master_log)
+                    data = fetch_with_retry(f"https://{IG_API_HOST}/search_hashtag.php", IG_HEADERS, {"hashtag": kw, "pagination_token": pag_token}, log_container=master_log)
                     batch = []
                     if 'posts' in data and 'edges' in data['posts']: batch.extend(data['posts']['edges'])
                     if len(collected_posts) == 0 and 'top_posts' in data and 'edges' in data['top_posts']: batch.extend(data['top_posts']['edges'])
@@ -257,7 +257,7 @@ if st.button("🚀 Start End-to-End Pipeline", type="primary", use_container_wid
                     if post['Total Comments'] > 0:
                         c_pag = ""
                         while len(extracted_comments) < ig_comm_limit:
-                            c_data = fetch_with_retry(f"https://{IG_API_HOST}/get_post_comments.php", IG_HEADERS, {"media_code": post['shortcode'], "sort_order": "popular", "pagination_token": c_pag}, master_log)
+                            c_data = fetch_with_retry(f"https://{IG_API_HOST}/get_post_comments.php", IG_HEADERS, {"media_code": post['shortcode'], "sort_order": "popular", "pagination_token": c_pag}, log_container=master_log)
                             r_comms = c_data.get('comments', [])
                             if not r_comms: 
                                 if 'data' in c_data and isinstance(c_data['data'], list): r_comms = c_data['data']
@@ -314,7 +314,7 @@ if st.button("🚀 Start End-to-End Pipeline", type="primary", use_container_wid
 
                 # Videos
                 while len(collected_vids) < tk_post_limit:
-                    data = fetch_with_retry(f"https://{TK_API_HOST}/search-video/", TK_HEADERS, {"keyword": kw, "count": "20", "cursor": str(cursor), "region": tk_region}, master_log)
+                    data = fetch_with_retry(f"https://{TK_API_HOST}/search-video/", TK_HEADERS, {"keyword": kw, "count": "20", "cursor": str(cursor), "region": tk_region}, log_container=master_log)
                     batch = data.get('videos') or data.get('aweme_list') or []
                     if not batch: break
                     
