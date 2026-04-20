@@ -1,0 +1,11 @@
+streamlit==1.42.0
+requests
+pandas
+transformers
+torch
+tf-keras
+clean-text
+bertopic
+sentence-transformers
+scikit-learn
+google-generativeai
