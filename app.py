@@ -120,23 +120,30 @@ def generate_deep_insights(raw_scraped_data, text_key):
             docs_to_process.append(f"POST CONTEXT: {p_text} | COMMENT: {c_text}")
 
     if not docs_to_process:
-        return []
+        return [{"Status": "No data found to analyze."}]
 
     # 2. Clean
-    cleaned_docs = [clean_social_text(doc) for doc in docs_to_process]
+    cleaned_docs = [clean_social_text(doc) for doc in docs_to_process if doc]
+
+    # --- 🛡️ LOW DATA SAFETY GUARD ---
+    if len(cleaned_docs) < 15:
+        return [{"Status": "Insufficient Data", "Message": f"Only found {len(cleaned_docs)} pieces of text. The AI requires at least 15 comments/posts to identify meaningful clusters. Please increase your limits or try broader keywords."}]
 
     # 3. Cluster (Safe sizing)
     safe_topic_size = max(3, min(15, len(cleaned_docs) // 5)) 
     vectorizer_model = CountVectorizer(ngram_range=(1, 2), stop_words="english")
     representation_model = MaximalMarginalRelevance(diversity=0.5)
 
-    topic_model = BERTopic(
-        embedding_model=embedding_model, 
-        min_topic_size=safe_topic_size,
-        vectorizer_model=vectorizer_model,
-        representation_model=representation_model
-    )
-    topics, probs = topic_model.fit_transform(cleaned_docs)
+    try:
+        topic_model = BERTopic(
+            embedding_model=embedding_model, 
+            min_topic_size=safe_topic_size,
+            vectorizer_model=vectorizer_model,
+            representation_model=representation_model
+        )
+        topics, probs = topic_model.fit_transform(cleaned_docs)
+    except Exception as e:
+        return [{"Status": "Clustering Error", "Message": "The AI could not form clusters, usually because the data lacked variety or was too small.", "Error_Details": str(e)}]
 
     # 4. Extract via Gemini
     topic_info = topic_model.get_topic_info()
