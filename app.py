@@ -111,7 +111,6 @@ def clean_social_text(text):
 
 def generate_deep_insights(raw_scraped_data, text_key):
     """Runs the BERTopic + Gemini Pipeline directly from raw data lists"""
-    # 1. Bind Context
     docs_to_process = []
     for post in raw_scraped_data:
         p_text = str(post.get(text_key, ""))
@@ -122,14 +121,11 @@ def generate_deep_insights(raw_scraped_data, text_key):
     if not docs_to_process:
         return [{"Status": "No data found to analyze."}]
 
-    # 2. Clean
     cleaned_docs = [clean_social_text(doc) for doc in docs_to_process if doc]
 
-    # --- 🛡️ LOW DATA SAFETY GUARD ---
     if len(cleaned_docs) < 15:
-        return [{"Status": "Insufficient Data", "Message": f"Only found {len(cleaned_docs)} pieces of text. The AI requires at least 15 comments/posts to identify meaningful clusters. Please increase your limits or try broader keywords."}]
+        return [{"Status": "Insufficient Data", "Message": f"Only found {len(cleaned_docs)} pieces of text. The AI requires at least 15 comments/posts to identify meaningful clusters."}]
 
-    # 3. Cluster (Safe sizing)
     safe_topic_size = max(3, min(15, len(cleaned_docs) // 5)) 
     vectorizer_model = CountVectorizer(ngram_range=(1, 2), stop_words="english")
     representation_model = MaximalMarginalRelevance(diversity=0.5)
@@ -143,9 +139,8 @@ def generate_deep_insights(raw_scraped_data, text_key):
         )
         topics, probs = topic_model.fit_transform(cleaned_docs)
     except Exception as e:
-        return [{"Status": "Clustering Error", "Message": "The AI could not form clusters, usually because the data lacked variety or was too small.", "Error_Details": str(e)}]
+        return [{"Status": "Clustering Error", "Message": "The AI could not form clusters. Data may lack variety or be too small.", "Error_Details": str(e)}]
 
-    # 4. Extract via Gemini
     topic_info = topic_model.get_topic_info()
     valid_topics = topic_info[topic_info['Topic'] != -1].head(10)
     
@@ -188,10 +183,198 @@ def create_zip(files_dict):
     return zip_buffer.getvalue()
 
 # ==========================================
+# PARALLEL PIPELINE FUNCTIONS
+# ==========================================
+def run_instagram_pipeline(ig_keywords, ig_post_limit, ig_comm_limit, master_log):
+    master_log.write("🚀 **IG Pipeline Started!**")
+    ig_raw_data = []
+    generated_files = {}
+
+    for kw in ig_keywords:
+        master_log.write(f"🔍 **IG:** Searching '#{kw}'...")
+        collected_posts = []
+        pag_token = ""
+        
+        while len(collected_posts) < ig_post_limit:
+            data = fetch_with_retry(f"https://{IG_API_HOST}/search_hashtag.php", IG_HEADERS, {"hashtag": kw, "pagination_token": pag_token}, log_container=master_log)
+            batch = []
+            if 'posts' in data and 'edges' in data['posts']: batch.extend(data['posts']['edges'])
+            if len(collected_posts) == 0 and 'top_posts' in data and 'edges' in data['top_posts']: batch.extend(data['top_posts']['edges'])
+            if not batch: break
+
+            for edge in batch:
+                node = edge.get('node', {})
+                c_edges = node.get('edge_media_to_caption', {}).get('edges', [])
+                
+                # --- IG Post Date Extraction ---
+                raw_ts = node.get('taken_at_timestamp')
+                post_date = datetime.fromtimestamp(raw_ts).strftime('%Y-%m-%d %H:%M:%S') if raw_ts else "Unknown"
+
+                collected_posts.append({
+                    "Keyword": kw,
+                    "Post URL": f"https://www.instagram.com/p/{node.get('shortcode')}/",
+                    "shortcode": node.get('shortcode'),
+                    "Post Date": post_date,
+                    "Post Text": c_edges[0]['node']['text'] if c_edges else "",
+                    "Total Comments": node.get('edge_media_to_comment', {}).get('count') or 0
+                })
+            pag_token = data.get('pagination_token')
+            if not pag_token: break
+
+        collected_posts = collected_posts[:ig_post_limit]
+        master_log.write(f"📥 **IG:** Found {len(collected_posts)} posts for #{kw}. Extracting comments...")
+
+        for post in collected_posts:
+            extracted_comments = []
+            if post['Total Comments'] > 0:
+                c_pag = ""
+                while len(extracted_comments) < ig_comm_limit:
+                    c_data = fetch_with_retry(f"https://{IG_API_HOST}/get_post_comments.php", IG_HEADERS, {"media_code": post['shortcode'], "sort_order": "popular", "pagination_token": c_pag}, log_container=master_log)
+                    r_comms = c_data.get('comments', [])
+                    if not r_comms: 
+                        if 'data' in c_data and isinstance(c_data['data'], list): r_comms = c_data['data']
+                    if not r_comms: break
+
+                    for c in r_comms:
+                        if len(extracted_comments) >= ig_comm_limit: break
+                        node = c.get('node', c)
+                        
+                        # --- IG Comment Date Extraction ---
+                        c_ts = node.get('created_at')
+                        comm_date = datetime.fromtimestamp(c_ts).strftime('%Y-%m-%d %H:%M:%S') if c_ts else "Unknown"
+
+                        extracted_comments.append({
+                            "Post URL": post['Post URL'],
+                            "Comment ID": str(node.get('id', '')),
+                            "Comment Date": comm_date,
+                            "Username": f"@{node.get('user', {}).get('username', 'Unknown')}",
+                            "Comment Text": str(node.get('text', '')).replace('\n', ' '),
+                        })
+                    c_pag = c_data.get('pagination_token') or c_data.get('next_max_id')
+                    if not c_pag: break
+                    time.sleep(1)
+
+            post["Raw Comments"] = extracted_comments
+            ig_raw_data.append(post)
+
+    if ig_raw_data:
+        ig_processed = []
+        ig_all_comms = []
+        master_log.write("🧠 **IG:** Running NLP & Extracting Insights...")
+        
+        with ThreadPoolExecutor(max_workers=ANALYSIS_WORKERS) as executor:
+            for future in as_completed([executor.submit(process_rage_analysis, p) for p in ig_raw_data]):
+                res = future.result()
+                if res.get("Raw Comments"): ig_all_comms.extend(res["Raw Comments"])
+                res_copy = res.copy()
+                del res_copy["Raw Comments"]
+                ig_processed.append(res_copy)
+
+        ig_insights = generate_deep_insights(ig_raw_data, "Post Text")
+
+        generated_files["IG_1_Posts.csv"] = pd.DataFrame(ig_processed).to_csv(index=False)
+        if ig_all_comms: generated_files["IG_2_Comments.csv"] = pd.DataFrame(ig_all_comms).to_csv(index=False)
+        if ig_insights: generated_files["IG_3_Marketing_Briefs.csv"] = pd.DataFrame(ig_insights).to_csv(index=False)
+
+    master_log.write("🟢 **Instagram Pipeline Fully Complete!**")
+    return generated_files
+
+
+def run_tiktok_pipeline(tk_keywords, tk_region, tk_post_limit, tk_comm_limit, master_log):
+    master_log.write("🚀 **TK Pipeline Started!**")
+    tk_raw_data = []
+    generated_files = {}
+
+    for kw in tk_keywords:
+        master_log.write(f"🔍 **TK:** Searching '{kw}'...")
+        collected_vids = []
+        cursor = 0
+
+        while len(collected_vids) < tk_post_limit:
+            data = fetch_with_retry(f"https://{TK_API_HOST}/search-video/", TK_HEADERS, {"keyword": kw, "count": "20", "cursor": str(cursor), "region": tk_region}, log_container=master_log)
+            batch = data.get('videos') or data.get('aweme_list') or []
+            if not batch: break
+            
+            collected_vids.extend(batch)
+            cursor += 20
+            if data.get('has_more') == 0: break
+            time.sleep(1)
+
+        collected_vids = collected_vids[:tk_post_limit]
+        master_log.write(f"📥 **TK:** Found {len(collected_vids)} vids for '{kw}'. Extracting comments...")
+
+        for vid in collected_vids:
+            handle = vid.get('author', {}).get('unique_id', 'Unknown')
+            v_url = f"https://www.tiktok.com/@{handle}/video/{vid.get('video_id') or vid.get('aweme_id')}"
+            t_comments = vid.get('statistics', {}).get('comment_count', 0)
+            
+            # --- TK Post Date Extraction ---
+            v_ts = vid.get('create_time')
+            post_date = datetime.fromtimestamp(v_ts).strftime('%Y-%m-%d %H:%M:%S') if v_ts else "Unknown"
+            
+            extracted_comments = []
+            if t_comments > 0:
+                c_cursor = 0
+                while len(extracted_comments) < tk_comm_limit:
+                    c_data = fetch_with_retry(f"https://{TK_API_HOST}/post-comments/?url={urllib.parse.quote(v_url, safe='')}&cursor={c_cursor}", TK_HEADERS, log_container=master_log)
+                    batch = c_data.get('comments', [])
+                    if not batch: break
+
+                    for c in batch:
+                        if len(extracted_comments) >= tk_comm_limit: break
+                        
+                        # --- TK Comment Date Extraction ---
+                        c_ts = c.get('create_time')
+                        comm_date = datetime.fromtimestamp(c_ts).strftime('%Y-%m-%d %H:%M:%S') if c_ts else "Unknown"
+
+                        extracted_comments.append({
+                            "Video URL": v_url,
+                            "Comment ID": c.get('id', ''),
+                            "Comment Date": comm_date,
+                            "Username": f"@{c.get('user', {}).get('unique_id', 'Unknown')}",
+                            "Comment Text": str(c.get('text', '')).replace('\n', ' ')
+                        })
+                    c_cursor = c_data.get('cursor', 0)
+                    if not c_data.get('hasMore', False): break
+                    time.sleep(1)
+            
+            tk_raw_data.append({
+                "Keyword": kw,
+                "Video URL": v_url,
+                "Post Date": post_date,
+                "Video Text": vid.get('title') or vid.get('desc', ''),
+                "Total Comments": t_comments,
+                "Raw Comments": extracted_comments
+            })
+
+    if tk_raw_data:
+        tk_processed = []
+        tk_all_comms = []
+        master_log.write("🧠 **TK:** Running NLP & Extracting Insights...")
+        
+        with ThreadPoolExecutor(max_workers=ANALYSIS_WORKERS) as executor:
+            for future in as_completed([executor.submit(process_rage_analysis, p) for p in tk_raw_data]):
+                res = future.result()
+                if res.get("Raw Comments"): tk_all_comms.extend(res["Raw Comments"])
+                res_copy = res.copy()
+                del res_copy["Raw Comments"]
+                tk_processed.append(res_copy)
+
+        tk_insights = generate_deep_insights(tk_raw_data, "Video Text")
+
+        generated_files["TK_1_Posts.csv"] = pd.DataFrame(tk_processed).to_csv(index=False)
+        if tk_all_comms: generated_files["TK_2_Comments.csv"] = pd.DataFrame(tk_all_comms).to_csv(index=False)
+        if tk_insights: generated_files["TK_3_Marketing_Briefs.csv"] = pd.DataFrame(tk_insights).to_csv(index=False)
+
+    master_log.write("🟢 **TikTok Pipeline Fully Complete!**")
+    return generated_files
+
+
+# ==========================================
 # APP UI & EXECUTION
 # ==========================================
 st.header("⚙️ 1. Pipeline Configuration")
-st.markdown("Configure limits and upload your target keyword CSVs (first column will be read). You can run one or both platforms simultaneously.")
+st.markdown("Configure limits and upload your target keyword CSVs (first column will be read). Both platforms will run concurrently to save time.")
 
 col1, col2 = st.columns(2)
 
@@ -219,177 +402,31 @@ if st.button("🚀 Start End-to-End Pipeline", type="primary", use_container_wid
     final_zip_files = {}
     master_log = st.expander("Live Pipeline Execution Logs", expanded=True)
 
-    # ---------------------------------------------------------
-    # INSTAGRAM PIPELINE
-    # ---------------------------------------------------------
-    if ig_file:
-        master_log.write("### 🚀 Starting Instagram Pipeline")
-        ig_keywords = pd.read_csv(ig_file, header=None).iloc[:, 0].dropna().astype(str).tolist()
-        ig_raw_data = []
-
-        with st.spinner("Scraping Instagram..."):
-            for kw in ig_keywords:
-                master_log.write(f"🔍 **IG:** Searching '#{kw}'...")
-                collected_posts = []
-                pag_token = ""
+    # Use ThreadPoolExecutor to run both platforms at the EXACT SAME TIME
+    with st.spinner("Scraping and Analyzing in Parallel..."):
+        with ThreadPoolExecutor(max_workers=2) as main_executor:
+            futures = []
+            
+            if ig_file:
+                ig_keywords = pd.read_csv(ig_file, header=None).iloc[:, 0].dropna().astype(str).tolist()
+                futures.append(main_executor.submit(run_instagram_pipeline, ig_keywords, ig_post_limit, ig_comm_limit, master_log))
                 
-                # Posts
-                while len(collected_posts) < ig_post_limit:
-                    data = fetch_with_retry(f"https://{IG_API_HOST}/search_hashtag.php", IG_HEADERS, {"hashtag": kw, "pagination_token": pag_token}, log_container=master_log)
-                    batch = []
-                    if 'posts' in data and 'edges' in data['posts']: batch.extend(data['posts']['edges'])
-                    if len(collected_posts) == 0 and 'top_posts' in data and 'edges' in data['top_posts']: batch.extend(data['top_posts']['edges'])
-                    if not batch: break
-
-                    for edge in batch:
-                        node = edge.get('node', {})
-                        c_edges = node.get('edge_media_to_caption', {}).get('edges', [])
-                        
-                        collected_posts.append({
-                            "Keyword": kw,
-                            "Post URL": f"https://www.instagram.com/p/{node.get('shortcode')}/",
-                            "shortcode": node.get('shortcode'),
-                            "Post Text": c_edges[0]['node']['text'] if c_edges else "",
-                            "Total Comments": node.get('edge_media_to_comment', {}).get('count') or 0
-                        })
-                    pag_token = data.get('pagination_token')
-                    if not pag_token: break
-
-                collected_posts = collected_posts[:ig_post_limit]
-                master_log.write(f"📥 **IG:** Found {len(collected_posts)} posts for #{kw}. Extracting up to {ig_comm_limit} comments each...")
-
-                # Comments
-                for post in collected_posts:
-                    extracted_comments = []
-                    if post['Total Comments'] > 0:
-                        c_pag = ""
-                        while len(extracted_comments) < ig_comm_limit:
-                            c_data = fetch_with_retry(f"https://{IG_API_HOST}/get_post_comments.php", IG_HEADERS, {"media_code": post['shortcode'], "sort_order": "popular", "pagination_token": c_pag}, log_container=master_log)
-                            r_comms = c_data.get('comments', [])
-                            if not r_comms: 
-                                if 'data' in c_data and isinstance(c_data['data'], list): r_comms = c_data['data']
-                            if not r_comms: break
-
-                            for c in r_comms:
-                                if len(extracted_comments) >= ig_comm_limit: break
-                                node = c.get('node', c)
-                                extracted_comments.append({
-                                    "Post URL": post['Post URL'],
-                                    "Comment ID": str(node.get('id', '')),
-                                    "Username": f"@{node.get('user', {}).get('username', 'Unknown')}",
-                                    "Comment Text": str(node.get('text', '')).replace('\n', ' '),
-                                })
-                            c_pag = c_data.get('pagination_token') or c_data.get('next_max_id')
-                            if not c_pag: break
-                            time.sleep(1)
-
-                    post["Raw Comments"] = extracted_comments
-                    ig_raw_data.append(post)
-
-        if ig_raw_data:
-            ig_processed = []
-            ig_all_comms = []
-            with st.spinner("🧠 IG: Running Rage NLP..."):
-                with ThreadPoolExecutor(max_workers=ANALYSIS_WORKERS) as executor:
-                    for future in as_completed([executor.submit(process_rage_analysis, p) for p in ig_raw_data]):
-                        res = future.result()
-                        if res.get("Raw Comments"): ig_all_comms.extend(res["Raw Comments"])
-                        res_copy = res.copy()
-                        del res_copy["Raw Comments"]
-                        ig_processed.append(res_copy)
-
-            with st.spinner("🧠 IG: Generating Culture Briefs (BERTopic + Gemini)..."):
-                ig_insights = generate_deep_insights(ig_raw_data, "Post Text")
-
-            final_zip_files["IG_1_Posts.csv"] = pd.DataFrame(ig_processed).to_csv(index=False)
-            if ig_all_comms: final_zip_files["IG_2_Comments.csv"] = pd.DataFrame(ig_all_comms).to_csv(index=False)
-            if ig_insights: final_zip_files["IG_3_Marketing_Briefs.csv"] = pd.DataFrame(ig_insights).to_csv(index=False)
-
-    # ---------------------------------------------------------
-    # TIKTOK PIPELINE
-    # ---------------------------------------------------------
-    if tk_file:
-        master_log.write("### 🚀 Starting TikTok Pipeline")
-        tk_keywords = pd.read_csv(tk_file, header=None).iloc[:, 0].dropna().astype(str).tolist()
-        tk_raw_data = []
-
-        with st.spinner("Scraping TikTok..."):
-            for kw in tk_keywords:
-                master_log.write(f"🔍 **TK:** Searching '{kw}'...")
-                collected_vids = []
-                cursor = 0
-
-                # Videos
-                while len(collected_vids) < tk_post_limit:
-                    data = fetch_with_retry(f"https://{TK_API_HOST}/search-video/", TK_HEADERS, {"keyword": kw, "count": "20", "cursor": str(cursor), "region": tk_region}, log_container=master_log)
-                    batch = data.get('videos') or data.get('aweme_list') or []
-                    if not batch: break
-                    
-                    collected_vids.extend(batch)
-                    cursor += 20
-                    if data.get('has_more') == 0: break
-                    time.sleep(1)
-
-                collected_vids = collected_vids[:tk_post_limit]
-                master_log.write(f"📥 **TK:** Found {len(collected_vids)} vids for {kw}. Extracting up to {tk_comm_limit} comments each...")
-
-                # Comments
-                for vid in collected_vids:
-                    handle = vid.get('author', {}).get('unique_id', 'Unknown')
-                    v_url = f"https://www.tiktok.com/@{handle}/video/{vid.get('video_id') or vid.get('aweme_id')}"
-                    t_comments = vid.get('statistics', {}).get('comment_count', 0)
-                    
-                    extracted_comments = []
-                    if t_comments > 0:
-                        c_cursor = 0
-                        while len(extracted_comments) < tk_comm_limit:
-                            c_data = fetch_with_retry(f"https://{TK_API_HOST}/post-comments/?url={urllib.parse.quote(v_url, safe='')}&cursor={c_cursor}", TK_HEADERS, log_container=master_log)
-                            batch = c_data.get('comments', [])
-                            if not batch: break
-
-                            for c in batch:
-                                if len(extracted_comments) >= tk_comm_limit: break
-                                extracted_comments.append({
-                                    "Video URL": v_url,
-                                    "Comment ID": c.get('id', ''),
-                                    "Username": f"@{c.get('user', {}).get('unique_id', 'Unknown')}",
-                                    "Comment Text": str(c.get('text', '')).replace('\n', ' ')
-                                })
-                            c_cursor = c_data.get('cursor', 0)
-                            if not c_data.get('hasMore', False): break
-                            time.sleep(1)
-                    
-                    tk_raw_data.append({
-                        "Keyword": kw,
-                        "Video URL": v_url,
-                        "Video Text": vid.get('title') or vid.get('desc', ''),
-                        "Total Comments": t_comments,
-                        "Raw Comments": extracted_comments
-                    })
-
-        if tk_raw_data:
-            tk_processed = []
-            tk_all_comms = []
-            with st.spinner("🧠 TK: Running Rage NLP..."):
-                with ThreadPoolExecutor(max_workers=ANALYSIS_WORKERS) as executor:
-                    for future in as_completed([executor.submit(process_rage_analysis, p) for p in tk_raw_data]):
-                        res = future.result()
-                        if res.get("Raw Comments"): tk_all_comms.extend(res["Raw Comments"])
-                        res_copy = res.copy()
-                        del res_copy["Raw Comments"]
-                        tk_processed.append(res_copy)
-
-            with st.spinner("🧠 TK: Generating Culture Briefs (BERTopic + Gemini)..."):
-                tk_insights = generate_deep_insights(tk_raw_data, "Video Text")
-
-            final_zip_files["TK_1_Posts.csv"] = pd.DataFrame(tk_processed).to_csv(index=False)
-            if tk_all_comms: final_zip_files["TK_2_Comments.csv"] = pd.DataFrame(tk_all_comms).to_csv(index=False)
-            if tk_insights: final_zip_files["TK_3_Marketing_Briefs.csv"] = pd.DataFrame(tk_insights).to_csv(index=False)
+            if tk_file:
+                tk_keywords = pd.read_csv(tk_file, header=None).iloc[:, 0].dropna().astype(str).tolist()
+                futures.append(main_executor.submit(run_tiktok_pipeline, tk_keywords, tk_region, tk_post_limit, tk_comm_limit, master_log))
+            
+            # Wait for both to finish and collect all files
+            for future in as_completed(futures):
+                try:
+                    result_files = future.result()
+                    final_zip_files.update(result_files)
+                except Exception as e:
+                    master_log.error(f"❌ A critical error occurred in one of the pipelines: {e}")
 
     # ---------------------------------------------------------
     # FINAL EXPORT
     # ---------------------------------------------------------
-    st.success("🎉 Pipeline Complete! All data has been scored and analyzed.")
+    st.success("🎉 All Pipelines Complete! Data is ready for download.")
     
     if final_zip_files:
         st.download_button(
