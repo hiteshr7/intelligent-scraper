@@ -1,0 +1,20 @@
+# Ignore local secrets and passwords
+.streamlit/secrets.toml
+secrets.toml
+.env
+
+# Ignore Python cache and virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.venv/
+
+# Ignore downloaded CSV and ZIP data
+*.csv
+*.zip
+*.json
+
+# Ignore Mac system files
+.DS_Store
