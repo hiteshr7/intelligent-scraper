@@ -7,8 +7,10 @@ import random
 import json
 import zipfile
 import io
+import threading
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
 
 # --- ML & Analysis Imports ---
 from transformers import pipeline
@@ -62,6 +64,14 @@ classifier = load_hf_classifier()
 embedding_model = load_sentence_transformer()
 
 # ==========================================
+# THREADING WRAPPER (Fixed)
+# ==========================================
+def safe_thread_run(ctx, func, *args):
+    """Gives background threads VIP access to update the Streamlit UI."""
+    add_script_run_ctx(threading.current_thread(), ctx)
+    return func(*args)
+
+# ==========================================
 # CORE FUNCTIONS
 # ==========================================
 def fetch_with_retry(url, headers, params=None, max_retries=5, log_container=None):
@@ -88,7 +98,6 @@ def get_anger_score(text):
     except: return 0.0
 
 def process_rage_analysis(post_dict):
-    """Calculates Rage for both IG and TK posts & comments"""
     text_key = "Post Text" if "Post Text" in post_dict else "Video Text"
     post_dict["Post Rage Score (%)"] = get_anger_score(post_dict.get(text_key, ""))
     
@@ -110,7 +119,6 @@ def clean_social_text(text):
                  replace_with_url="<URL>", replace_with_email="<EMAIL>", replace_with_phone_number="<PHONE>")
 
 def generate_deep_insights(raw_scraped_data, text_key):
-    """Runs the BERTopic + Gemini Pipeline directly from raw data lists"""
     docs_to_process = []
     for post in raw_scraped_data:
         p_text = str(post.get(text_key, ""))
@@ -206,7 +214,6 @@ def run_instagram_pipeline(ig_keywords, ig_post_limit, ig_comm_limit, master_log
                 node = edge.get('node', {})
                 c_edges = node.get('edge_media_to_caption', {}).get('edges', [])
                 
-                # --- IG Post Date Extraction ---
                 raw_ts = node.get('taken_at_timestamp')
                 post_date = datetime.fromtimestamp(raw_ts).strftime('%Y-%m-%d %H:%M:%S') if raw_ts else "Unknown"
 
@@ -239,7 +246,6 @@ def run_instagram_pipeline(ig_keywords, ig_post_limit, ig_comm_limit, master_log
                         if len(extracted_comments) >= ig_comm_limit: break
                         node = c.get('node', c)
                         
-                        # --- IG Comment Date Extraction ---
                         c_ts = node.get('created_at')
                         comm_date = datetime.fromtimestamp(c_ts).strftime('%Y-%m-%d %H:%M:%S') if c_ts else "Unknown"
 
@@ -308,7 +314,6 @@ def run_tiktok_pipeline(tk_keywords, tk_region, tk_post_limit, tk_comm_limit, ma
             v_url = f"https://www.tiktok.com/@{handle}/video/{vid.get('video_id') or vid.get('aweme_id')}"
             t_comments = vid.get('statistics', {}).get('comment_count', 0)
             
-            # --- TK Post Date Extraction ---
             v_ts = vid.get('create_time')
             post_date = datetime.fromtimestamp(v_ts).strftime('%Y-%m-%d %H:%M:%S') if v_ts else "Unknown"
             
@@ -323,7 +328,6 @@ def run_tiktok_pipeline(tk_keywords, tk_region, tk_post_limit, tk_comm_limit, ma
                     for c in batch:
                         if len(extracted_comments) >= tk_comm_limit: break
                         
-                        # --- TK Comment Date Extraction ---
                         c_ts = c.get('create_time')
                         comm_date = datetime.fromtimestamp(c_ts).strftime('%Y-%m-%d %H:%M:%S') if c_ts else "Unknown"
 
@@ -402,18 +406,21 @@ if st.button("🚀 Start End-to-End Pipeline", type="primary", use_container_wid
     final_zip_files = {}
     master_log = st.expander("Live Pipeline Execution Logs", expanded=True)
 
-    # Use ThreadPoolExecutor to run both platforms at the EXACT SAME TIME
+    # 1. Grab the Context from the Main Webpage Thread
+    ctx = get_script_run_ctx()
+
+    # Use ThreadPoolExecutor wrapped with safe_thread_run, explicitly passing the context
     with st.spinner("Scraping and Analyzing in Parallel..."):
         with ThreadPoolExecutor(max_workers=2) as main_executor:
             futures = []
             
             if ig_file:
                 ig_keywords = pd.read_csv(ig_file, header=None).iloc[:, 0].dropna().astype(str).tolist()
-                futures.append(main_executor.submit(run_instagram_pipeline, ig_keywords, ig_post_limit, ig_comm_limit, master_log))
+                futures.append(main_executor.submit(safe_thread_run, ctx, run_instagram_pipeline, ig_keywords, ig_post_limit, ig_comm_limit, master_log))
                 
             if tk_file:
                 tk_keywords = pd.read_csv(tk_file, header=None).iloc[:, 0].dropna().astype(str).tolist()
-                futures.append(main_executor.submit(run_tiktok_pipeline, tk_keywords, tk_region, tk_post_limit, tk_comm_limit, master_log))
+                futures.append(main_executor.submit(safe_thread_run, ctx, run_tiktok_pipeline, tk_keywords, tk_region, tk_post_limit, tk_comm_limit, master_log))
             
             # Wait for both to finish and collect all files
             for future in as_completed(futures):
@@ -421,7 +428,7 @@ if st.button("🚀 Start End-to-End Pipeline", type="primary", use_container_wid
                     result_files = future.result()
                     final_zip_files.update(result_files)
                 except Exception as e:
-                    master_log.error(f"❌ A critical error occurred in one of the pipelines: {e}")
+                    master_log.error(f"❌ A critical error occurred: {e}")
 
     # ---------------------------------------------------------
     # FINAL EXPORT
